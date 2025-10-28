@@ -1,0 +1,68 @@
+###
+@host = http://localhost:8080
+@api_v1 = {{host}}/api/v1
+# 用于存储登录后获取的 token
+@token =
+
+### 1. 登录并捕获 Token (带调试日志)
+# @name loginRequest
+POST {{api_v1}}/login
+Content-Type: application/json
+
+{
+    "username": "restclient_user",
+    "password": "password123"
+}
+
+> {%
+    client.log("--- SCRIPT DEBUG START ---");
+    client.log("Response Body received by script:");
+    client.log(JSON.stringify(response.body, null, 2)); // 打印完整的响应体
+
+    const tokenValue = response.body.token;
+    client.log("Value of response.body.token: " + tokenValue);
+
+    if (tokenValue) {
+        client.global.set("token", tokenValue);
+        client.log("SUCCESS: Global variable 'token' has been set.");
+    } else {
+        client.log("ERROR: 'token' field was not found or was empty in the response body.");
+    }
+    client.log("--- SCRIPT DEBUG END ---");
+%}
+
+###
+GET {{api_v1}}/recordings
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzUxNDIwNDcwfQ.FCQRxQSXv30wOnVtVMaVoIp-GDB27kxru-4Y2FW86qc
+###
+# 上传录音文件 (这是一个受保护的接口)
+POST http://localhost:8080/api/v1/recordings/upload
+# 注意: Authorization Header 使用了上面登录请求中保存的变量
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIiwiZXhwIjoxNzUxMzU5MTc4fQ._lQ1sfq3pLjoR5yfljpJ4AYoNx17UEF9OmKLCCpNgFM
+# Content-Type 会由 REST Client 根据下面的 multipart 自动设置
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="text_id"
+
+1
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="audio_file"; filename="test.mp3"
+Content-Type: audio/mpeg
+
+# ！！！重要！！！
+# 将下面的路径替换为你自己测试音频文件的真实路径
+< ./test.mp3
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+
+
+### 1. 获取所有文本的列表 (公开)
+GET http://localhost:8080/api/v1/texts
+
+### 2. 获取 ID=1 的文本详情 (成功)
+GET http://localhost:8080/api/v1/texts/1
+
+### 3. 获取 ID=999 的文本详情 (失败)
+GET http://localhost:8080/api/v1/texts/999
+###

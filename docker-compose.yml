@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: myapp_backend
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend:/app
+    environment:
+      - DATABASE_URL=postgres://user:password@db:5432/mydatabase?sslmode=disable
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=youraccesskey
+      - MINIO_SECRET_KEY=yoursecretkey
+      - MINIO_USE_SSL=false
+      - MINIO_BUCKET_NAME=recordings
+      - JWT_SECRET=a-very-secure-secret-for-jwt
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - OLLAMA_API_URL=http://host.docker.internal:11434/api/generate
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  worker:
+    build: ./backend
+    container_name: myapp_worker # 建议也给 worker 一个名字
+    command: ./worker
+    environment:
+      - DATABASE_URL=postgres://user:password@db:5432/mydatabase?sslmode=disable
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:9000
+      - MINIO_ACCESS_KEY=youraccesskey
+      - MINIO_SECRET_KEY=yoursecretkey
+      - MINIO_USE_SSL=false
+      - MINIO_BUCKET_NAME=recordings
+      - JWT_SECRET=a-very-secure-secret-for-jwt
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - OLLAMA_API_URL=http://host.docker.internal:11434/api/generate
+      - ASR_API_URL=http://host.docker.internal:8000/transcribe
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  db:
+    image: postgres:14-alpine
+    container_name: myapp_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=mydatabase
+    healthcheck: # <-- 修正父级
+      test: ["CMD-SHELL", "pg_isready -U user -d mydatabase"] # <-- 修正缩进
+      interval: 5s                                           # <-- 修正缩进
+      timeout: 5s                                            # <-- 修正缩进
+      retries: 5                                             # <-- 修正缩进
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: minio/minio
+    container_name: myapp_minio
+    volumes:
+      - minio_data:/data
+    environment:
+      - MINIO_ROOT_USER=youraccesskey
+      - MINIO_ROOT_PASSWORD=yoursecretkey
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    command: server /data --console-address ":9001"
+
+  rabbitmq:
+    image: rabbitmq:3.11-management-alpine
+    container_name: myapp_rabbitmq # 建议也给 rabbitmq 一个名字
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq/
+    healthcheck: # <-- 修正父级
+      test: ["CMD", "rabbitmq-diagnostics", "ping"] # <-- 修正缩进
+      interval: 10s                                 # <-- 修正缩进
+      timeout: 5s                                   # <-- 修正缩进
+      retries: 5                                    # <-- 修正缩进
+  # !!! 新增 AI 服务 !!!
+volumes:
+  postgres_data:
+  minio_data:
+  rabbitmq_data:
