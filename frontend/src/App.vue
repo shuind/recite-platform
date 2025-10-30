@@ -11,6 +11,7 @@
           <div class="logo" @click="goHome">朗读练习</div>
 
           <el-menu-item index="/my-domains">我的圈子</el-menu-item>
+          <el-menu-item index="/tasks">任务规划</el-menu-item>
           <el-menu-item index="/my-content">我的内容</el-menu-item>
           <el-menu-item index="/forum">社区论坛</el-menu-item>
 
@@ -89,6 +90,12 @@ authStore.initializeAuth();
 </script>
 
 <style>
+:root {
+  --header-h: 78px;         /* 与你 App.vue 的 Header 高度一致 */
+  --left-panel-w: 300px;    /* 左侧面板宽度 */
+  --right-panel-w: 410px;   /* 右侧面板宽度（含一点内边距冗余） */
+}
+
 /* 全局基础样式 */
 html, body, #app {
   margin: 0;
@@ -149,7 +156,7 @@ html, body, #app {
 
 /* 主内容区 */
 .app-main-content {
-  flex: 1;
+  height: calc(100vh - var(--header-h));
   background-color: transparent !important;
   padding: 0;
   overflow: hidden;

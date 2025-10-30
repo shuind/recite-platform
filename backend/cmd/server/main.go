@@ -30,9 +30,11 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/shuind/language-learner/backend/internal/handler"
 	"github.com/shuind/language-learner/backend/internal/middleware"
 	"github.com/shuind/language-learner/backend/internal/model"
 	"github.com/shuind/language-learner/backend/internal/mq"
+	"github.com/shuind/language-learner/backend/internal/scheduler"
 	"github.com/shuind/language-learner/backend/internal/utils"
 )
 
@@ -135,7 +137,7 @@ func TranscribeRecordingHandler(c *gin.Context) {
 	}
 
 	// 3. 创建一个新的 Task
-	task := Task{
+	task := AudioTask{
 		RecordingID: uint(recordingID),
 		FileContent: fileContent,
 	}
@@ -291,7 +293,7 @@ func initDB() {
 	}
 
 	// 自动迁移模型，这部分保持不变
-	err = DB.AutoMigrate(&model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{})
+	err = DB.AutoMigrate(&model.TaskItem{}, &model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{})
 	if err != nil {
 		log.Fatalf("Failed to auto migrate: %v", err)
 	}
@@ -762,7 +764,7 @@ func GetTextHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, text)
 }
 
-type Task struct {
+type AudioTask struct {
 	RecordingID uint   `json:"recording_id"`
 	FileContent []byte `json:"file_content"`
 }
@@ -903,7 +905,7 @@ func UploadHandler(c *gin.Context) {
 	log.Printf("Created new recording record with ID: %d", newRecording.ID)
 
 	// 5. 将任务发布到 RabbitMQ (逻辑不变)
-	task := Task{ // 假设你的 Task 结构体是这样
+	task := AudioTask{ // 假设你的 Task 结构体是这样
 		RecordingID: newRecording.ID,
 		FileContent: fileBytes,
 	}
@@ -2610,6 +2612,16 @@ func main() {
 	initMinIO()
 	mqManager = mq.NewRabbitMQManager("audio_processing")
 
+	// 启动调度器
+	stopCron := scheduler.Start(scheduler.Config{
+		DB:       DB,
+		Logger:   log.Default(),
+		Env:      os.Getenv("APP_ENV"), // dev|prod
+		Timezone: os.Getenv("APP_TZ"),  // 默认 Asia/Shanghai
+		// ArchiveSpecOverride: "0 * * * * *", // 想临时改频率就写这里
+	})
+	defer stopCron()
+
 	// 2. 创建 Gin 引擎
 	r := gin.Default()
 	r.Use(func(c *gin.Context) {
@@ -2643,6 +2655,21 @@ func main() {
 		auth := apiV1.Group("/")
 		auth.Use(middleware.AuthMiddleware()) // 应用普通用户认证
 		{
+			// Task Planner
+			taskHandler := &handler.TaskHandler{DB: DB}
+
+			auth.POST("/tasks", taskHandler.Create)
+			auth.GET("/tasks", taskHandler.List) // ?view=auto|manual&status=todo|in_progress|done|archived
+			auth.GET("/tasks/:id", taskHandler.Get)
+			auth.PATCH("/tasks/:id", taskHandler.Update)
+			auth.DELETE("/tasks/:id", taskHandler.Delete)
+			auth.GET("/tasks/weekly-score", taskHandler.WeeklyScore)
+			auth.PUT("/tasks/reorder", taskHandler.Reorder)
+			auth.POST("/tasks/:id/complete", taskHandler.Complete)
+			auth.POST("/tasks/:id/snooze", taskHandler.Snooze)
+			auth.POST("/tasks/:id/undo", taskHandler.Undo)
+			auth.GET("/tasks/score-trend", taskHandler.ScoreTrend)
+
 			// === 个人资源 ===
 			auth.POST("/users/:id/follow", FollowUserHandler)
 			auth.DELETE("/users/:id/follow", UnfollowUserHandler)

@@ -9,6 +9,7 @@ import ProfilePage from '../views/ProfilePage.vue'
 import ForumPage from '../views/ForumPage.vue';
 import PostDetailPage from '../views/PostDetailPage.vue';
 import CreatePostPage from '../views/CreatePostPage.vue'; 
+import TasksPage from '../views/TasksPage.vue'
 const router = createRouter({
     history: createWebHistory(import.meta.env.BASE_URL),
     routes: [
@@ -74,6 +75,11 @@ const router = createRouter({
             path: '/forum/post/:postId', 
             name: 'post-detail', 
             component: PostDetailPage, 
+            meta: { requiresAuth: true } 
+        },
+        {   path: '/tasks', 
+            name: 'tasks', 
+            component: TasksPage,
             meta: { requiresAuth: true } 
         }
     ]
