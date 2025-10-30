@@ -4,7 +4,8 @@
        
   <div class="my-content-page">
     
-    <div class="content-layout-container">
+    <div class="content-layout-container"
+     :class="{ 'with-right': !isRightPanelCollapsed }">
       
       <!-- ============================================= -->
       <!--      折叠/展开按钮 (已移至外部并优化)         -->
@@ -853,11 +854,11 @@ const retryTranscribe = async (recording) => {
 }
 
 /* 2. 让内容包裹器撑满中间面板 */
-.content-view-wrapper {
-  flex-grow: 1; /* 占据所有可用空间 */
-  min-height: 0; /* Flexbox 关键技巧，允许子元素内部滚动 */
-  display: flex;
-  flex-direction: column;
+.content-view-wrapper { 
+  flex: 1 1 auto; 
+  min-height: 0; 
+  display: flex; 
+  flex-direction: column; 
 }
 
 /* 3. 【解决问题一】让文本编辑区自动伸展 */
@@ -906,12 +907,9 @@ const retryTranscribe = async (recording) => {
   flex-shrink: 0;
 }
 
-.history-list {
-  flex-grow: 1; /* 占据录音区的剩余空间 */
-  min-height: 0; /* 允许内部表格收缩 */
-  /* overflow-y: auto;  <-- 这个可以移除了 */
-  padding: 0 16px 16px 16px;
-}
+.history-list { flex: 1 1 auto; min-height: 0; padding: 0 16px 16px; }
+:deep(.el-table) { height: 100%; }
+:deep(.el-table__body-wrapper) { max-height: 100%; overflow: auto; }
 .recording-actions {
   display: flex;
   align-items: center; /* 垂直居中 */
@@ -924,6 +922,15 @@ const retryTranscribe = async (recording) => {
   flex-shrink: 0; /* 防止按钮被压缩 */
   margin-left: 10px;
 }
+/* 1280 以下：默认收起右侧 AI 面板；1100 以下：收起左侧面板 */
+@media (max-width: 1280px) {
+  .content-layout-container.with-right { padding-right: 16px; } /* 右侧展开时也不挤压中间 */
+}
+@media (max-width: 1100px) {
+  .left-panel { flex-basis: 0; opacity: 0; }
+  .left-panel-toggle { left: 0; }
+}
+
 /* ==========================================================================
    保留您其他的样式 (头部、按钮组、右键菜单等)
    ========================================================================== */
@@ -932,16 +939,30 @@ const retryTranscribe = async (recording) => {
 .tree-scrollbar, .custom-tree, :deep(.custom-tree .el-tree-node__content),
 :deep(.custom-tree .el-tree-node.is-current > .el-tree-node__content),
 .custom-tree-node .el-icon, .left-panel-toggle, .center-panel-header,
-.filename, .actions-group, .save-status, .right-panel-toggle, .context-menu,
+.filename, .actions-group, .save-status,  .context-menu,
 .menu-item, .menu-separator, .search-results, .search-result-item,
 .search-empty, .ai-assistant, .chat-history, .chat-message, .message-bubble,
-.loading-bubble, .chat-input, .recording-actions, .left-panel.collapsed, .right-panel.collapsed,
+.loading-bubble, .chat-input, .recording-actions, .left-panel.collapsed, 
 .left-panel-toggle.collapsed
  {
   /* 这里粘贴您提供的所有其他样式，确保它们保持不变 */
   /* 为节省篇幅，此处省略，请将您原有的、与核心布局无关的样式代码复制到这里 */
 }
-
+.right-panel.collapsed {
+  transform: translateX(100%);
+  opacity: 0;
+  pointer-events: none;
+}
+/* 中间容器在右侧展开时预留内边距，避免被 fixed 面板遮挡 */
+.content-layout-container.with-right {
+  padding-right: calc(var(--right-panel-w) + 16px);
+}
+.right-panel-toggle {
+  position: fixed;
+  top: calc(var(--header-h) + 8px);
+  right: 24px;
+  z-index: 100;
+}
 /* --- 您可以从这里开始，将您原有样式中除了上面已修正的部分，全部粘贴过来 --- */
 /*
  *  【全新修正的样式】
@@ -974,6 +995,12 @@ const retryTranscribe = async (recording) => {
 }
 
 /* 面板通用样式 */
+.left-panel {
+  flex: 0 0 var(--left-panel-w);
+  background: transparent;
+  overflow: hidden;
+  transition: flex-basis .25s ease, opacity .25s ease;
+}
 .left-panel, .right-panel {
   display: flex;
   flex-direction: column;
@@ -1006,7 +1033,6 @@ const retryTranscribe = async (recording) => {
 .left-panel.collapsed {
   flex-basis: 0;
   min-width: 0;
-  margin-right: -16px; 
   opacity: 0;
 }
 .left-panel .panel-header, .left-panel .panel-content {
@@ -1050,25 +1076,22 @@ const retryTranscribe = async (recording) => {
 }
 
 
-/* 左侧折叠按钮的定位 */
+/* 左侧折叠按钮基于变量定位 */
 .left-panel-toggle {
   position: absolute;
   top: 50%;
-  left: 284px; 
+  left: calc(var(--left-panel-w) - 16px); /* 与面板边缘贴边，16px为按钮宽度的一半微调 */
   transform: translateY(-50%);
   width: 24px;
   height: 48px;
-  background-color: #f0f2f5;
+  background: #f0f2f5;
   border: 1px solid #dcdfe6;
   border-left: none;
   border-top-right-radius: 6px;
   border-bottom-right-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  z-index: 10;
-  transition: all 0.3s ease-in-out;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; z-index: 10;
+  transition: left .25s ease, background-color .2s ease;
   box-shadow: 2px 0 5px rgba(0,0,0,0.04);
 }
 .left-panel-toggle:hover {
@@ -1087,7 +1110,18 @@ const retryTranscribe = async (recording) => {
 
 
 /* 右侧面板开关按钮 */
-.right-panel-toggle { position: fixed; top: 76px; right: 24px; z-index: 100; }
+.right-panel {
+  position: fixed;
+  top: var(--header-h);
+  right: 0;
+  width: var(--right-panel-w);
+  height: calc(100vh - var(--header-h));
+  background-color: transparent;
+  display: flex;
+  flex-direction: column;
+  transition: opacity .25s ease, transform .25s ease;
+  will-change: transform, opacity;
+}
 
 /* 其他样式 */
 .context-menu { position: fixed; background: white; border: 1px solid #ccc; box-shadow: 0 2px 10px rgba(0,0,0,0.1); border-radius: 4px; z-index: 1000; padding: 5px 0; }

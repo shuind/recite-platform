@@ -18,6 +18,8 @@ services:
     container_name: language_learner_backend
     command: ./server
     environment:
+      - APP_ENV=prod
+      - APP_TZ=Asia/Shanghai
       - GIN_MODE=release
       - DATABASE_URL=${DATABASE_URL}
       - MINIO_ENDPOINT=${MINIO_ENDPOINT}
