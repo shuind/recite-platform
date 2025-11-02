@@ -1,0 +1,32 @@
+# backend/Dockerfile.server
+
+# --- Stage 1: Build ---
+# 使用官方的 Go Alpine 镜像作为构建环境
+FROM golang:1.24-alpine AS builder
+
+# ... (构建阶段保持不变) ...
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /server ./cmd/server
+
+
+# --- Stage 2: Run ---
+# 使用一个极简的 Alpine 镜像作为最终的运行环境
+FROM alpine:latest
+
+# 【关键修改】安装时区数据包
+RUN apk add --no-cache tzdata
+
+# 设置工作目录
+WORKDIR /app
+
+# 从构建阶段复制编译好的二进制文件
+COPY --from=builder /server /app/server
+
+# 暴露端口
+EXPOSE 8080
+
+# 容器启动时运行的命令
+CMD ["/app/server"]

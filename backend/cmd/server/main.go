@@ -1,8 +1,10 @@
+// /cmd/server/main.go
 package main
 
 import (
 	"bytes"
 	"context" // <-- 新增：用于 MinIO 操作的上下文
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt" // <-- 新增：用于格式化字符串 (如文件名和URL)
@@ -22,6 +24,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"                 // <-- 新增：MinIO 主 SDK
 	"github.com/minio/minio-go/v7/pkg/credentials" // <-- 新增：MinIO 凭证管理
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -293,7 +296,7 @@ func initDB() {
 	}
 
 	// 自动迁移模型，这部分保持不变
-	err = DB.AutoMigrate(&model.TaskItem{}, &model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{})
+	err = DB.AutoMigrate(&model.Asset{}, &model.NodeContent{}, &model.ExportTask{}, &model.TaskItem{}, &model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{})
 	if err != nil {
 		log.Fatalf("Failed to auto migrate: %v", err)
 	}
@@ -354,6 +357,8 @@ func ListNodesHandler(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, nodes)
 }
+
+// CreateNodeHandler 创建一个新节点 (文件夹或空文本)
 func CreateNodeHandler(c *gin.Context) {
 	// 1. 获取当前用户ID
 	userID, exists := c.Get("userID")
@@ -369,37 +374,29 @@ func CreateNodeHandler(c *gin.Context) {
 		return
 	}
 
-	// 3. 安全验证：如果指定了 parent_id，必须验证该父节点存在且属于当前用户
+	// 3. 安全验证：如果指定了 parent_id，必须验证该父节点存在、属于当前用户且是文件夹
 	if input.ParentID != nil {
 		var parentNode model.Node
-		// 查找父节点，条件是 ID 匹配 且 userID 匹配
-		if err := DB.Where("id = ? AND user_id = ?", *input.ParentID, userID).First(&parentNode).Error; err != nil {
+		// 查找父节点，条件是 ID 匹配、userID 匹配且节点类型是 'folder'
+		if err := DB.Where("id = ? AND user_id = ? AND node_type = ?", *input.ParentID, userID, "folder").First(&parentNode).Error; err != nil {
 			if err == gorm.ErrRecordNotFound {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Parent folder not found or you don't have permission"})
+				// 错误信息更具体
+				c.JSON(http.StatusNotFound, gin.H{"error": "Parent folder not found, you don't have permission, or the target is not a folder."})
 				return
 			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
-			return
-		}
-		// 额外验证：父节点必须是 'folder' 类型
-		if parentNode.NodeType != "folder" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot create a node under a text file"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error while checking parent folder"})
 			return
 		}
 	}
 
 	// 4. 创建节点实例
+	// 【简化】只填充核心字段，Content 默认为空字符串 ""
 	newNode := model.Node{
-		UserID:   userID.(uint), // 从 context 取出的 userID 是 interface{}，需要类型断言
+		UserID:   userID.(uint),
 		ParentID: input.ParentID,
 		NodeType: input.NodeType,
 		Title:    input.Title,
-		Content:  input.Content,
-	}
-
-	// 如果是 folder，强制清空 content
-	if newNode.NodeType == "folder" {
-		newNode.Content = ""
+		Content:  "", // 新建时内容为空
 	}
 
 	// 5. 保存到数据库
@@ -412,35 +409,35 @@ func CreateNodeHandler(c *gin.Context) {
 	c.JSON(http.StatusCreated, newNode)
 }
 
+// 入参
 type UpdateNodeInput struct {
 	Title   *string `json:"title"`
 	Content *string `json:"content"`
 }
 
-// UpdateNodeHandler 更新一个节点 (标题或内容)
 func UpdateNodeHandler(c *gin.Context) {
-	// 1. 获取用户ID和URL中的节点ID
 	userID, _ := c.Get("userID")
 	nodeID := c.Param("id")
 
-	// 2. 绑定输入
-	var input UpdateNodeInput
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 3. 安全查找：必须确保节点存在且属于当前用户
 	var node model.Node
 	if err := DB.Where("id = ? AND user_id = ?", nodeID, userID).First(&node).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Node not found or permission denied"})
 		return
 	}
 
-	// 4. 应用更新
-	// 检查 title 是否被传入
+	var input UpdateNodeInput
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 只能更新 text 类型的节点
+	if node.NodeType != "text" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot update content for a folder"})
+		return
+	}
+
 	if input.Title != nil {
-		// 可以增加验证，比如标题不能为空
 		if strings.TrimSpace(*input.Title) == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Title cannot be empty"})
 			return
@@ -448,23 +445,14 @@ func UpdateNodeHandler(c *gin.Context) {
 		node.Title = *input.Title
 	}
 
-	// 检查 content 是否被传入
 	if input.Content != nil {
-		// 业务规则：文件夹不能有内容
-		if node.NodeType == "folder" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot set content for a folder"})
-			return
-		}
 		node.Content = *input.Content
 	}
 
-	// 5. 保存更新
 	if err := DB.Save(&node).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update node"})
 		return
 	}
-
-	// 6. 返回更新后的节点
 	c.JSON(http.StatusOK, node)
 }
 
@@ -616,6 +604,47 @@ func initMinIO() {
 			log.Fatalln(err)
 		}
 		log.Printf("Successfully set bucket policy for %s\n", bucketName)
+	}
+
+	// ✅ 确保 assets 桶存在
+	bucket := "assets"
+	ctx = context.Background()
+	exists, err = minioClient.BucketExists(ctx, bucket)
+	if err != nil {
+		log.Fatalf("Check bucket error: %v", err)
+	}
+	if !exists {
+		if err := minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+			log.Fatalf("Create bucket error: %v", err)
+		} else {
+			log.Printf("✅ Created bucket %q", bucket)
+		}
+	} else {
+		log.Printf("✅ Bucket %q already exists", bucket)
+	}
+
+	// 设置公开读策略
+	policy := `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::` + bucket + `/*"]}]}`
+	err = minioClient.SetBucketPolicy(ctx, bucket, policy)
+	if err != nil {
+		log.Printf("⚠️ Failed to set bucket policy: %v", err)
+	}
+
+	for _, bucket := range []string{"recordings", "assets"} {
+		exists, err := minioClient.BucketExists(ctx, bucket)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if !exists {
+			if err := minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{}); err != nil {
+				log.Fatal(err)
+			}
+		}
+		// 总是尝试设置公开读策略（如果你选择公开）
+		policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::%s/*"]}]}`, bucket)
+		if err := minioClient.SetBucketPolicy(ctx, bucket, policy); err != nil {
+			log.Printf("set policy failed for %s: %v", bucket, err)
+		}
 	}
 }
 
@@ -2600,6 +2629,270 @@ func ListDomainNodeCommentsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// 模型（示例）
+type Asset struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+
+	UserID    uint   `gorm:"index" json:"user_id"`
+	Bucket    string `json:"bucket"`
+	ObjectKey string `gorm:"index" json:"object_key"`
+	URL       string `json:"url"` // 公网可访问/或签名URL
+	MimeType  string `json:"mime_type"`
+	SizeBytes int64  `json:"size_bytes"`
+	SHA256    string `gorm:"index" json:"sha256"`
+}
+
+// UploadAsset 统一上传资产到 MinIO（图片/附件）
+func UploadAsset(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+
+	file, hdr, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "file is required"})
+		return
+	}
+	defer file.Close()
+
+	// 限流/上限（20MB）
+	buf, err := io.ReadAll(io.LimitReader(file, 20<<20))
+	if err != nil {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large"})
+		return
+	}
+
+	// MIME 检测
+	mime := http.DetectContentType(buf)
+	allowed := map[string]bool{
+		"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true,
+		"text/plain; charset=utf-8": true, "text/plain": true,
+		"application/octet-stream": true,
+	}
+	if !allowed[mime] && !strings.HasPrefix(mime, "image/") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported mime type", "detected": mime})
+		return
+	}
+
+	// SHA256 去重（同一用户）
+	sum := sha256.Sum256(buf)
+	sha := fmt.Sprintf("%x", sum[:])
+
+	var exist model.Asset
+	if err := DB.Where("user_id=? AND sha256=?", userID, sha).First(&exist).Error; err == nil {
+		c.JSON(http.StatusOK, gin.H{"id": exist.ID, "url": exist.URL})
+		return
+	}
+
+	// object key
+	ext := ""
+	if i := strings.LastIndex(hdr.Filename, "."); i >= 0 {
+		ext = strings.ToLower(hdr.Filename[i:])
+	}
+	bucket := os.Getenv("MINIO_BUCKET")
+	if bucket == "" {
+		bucket = "recordings"
+	} // 兼容你现有
+	objectKey := fmt.Sprintf("assets/%d/%d_%s%s", userID, time.Now().UnixNano(), generateRandomString(6), ext)
+
+	// 关键：传入 context.Context
+	ctx := c.Request.Context()
+
+	// 上传
+	reader := bytes.NewReader(buf)
+	_, err = minioClient.PutObject(ctx, bucket, objectKey, reader, int64(len(buf)), minio.PutObjectOptions{
+		ContentType: mime,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "upload to storage failed"})
+		return
+	}
+
+	// 公网 URL：优先使用 MINIO_PUBLIC_ENDPOINT（没有就回退 MINIO_ENDPOINT + scheme）
+	publicEndpoint := os.Getenv("MINIO_PUBLIC_ENDPOINT")
+	if publicEndpoint == "" {
+		endpoint := os.Getenv("MINIO_ENDPOINT")
+		useSSL := os.Getenv("MINIO_USE_SSL") == "true"
+		scheme := "http"
+		if useSSL {
+			scheme = "https"
+		}
+		publicEndpoint = fmt.Sprintf("%s://%s", scheme, endpoint)
+	}
+	url := fmt.Sprintf("%s/%s/%s", publicEndpoint, bucket, objectKey)
+
+	asset := model.Asset{
+		UserID:    userID,
+		Bucket:    bucket,
+		ObjectKey: objectKey,
+		URL:       url,
+		MimeType:  mime,
+		SizeBytes: int64(len(buf)),
+		SHA256:    sha,
+	}
+	if err := DB.Create(&asset).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db save failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"id": asset.ID, "url": asset.URL,
+		"mime_type": asset.MimeType, "size": asset.SizeBytes,
+	})
+}
+
+func GetAssetMeta(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+	id := c.Param("id")
+	var a model.Asset
+	if err := DB.Where("id=? AND user_id=?", id, userID).First(&a).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+	c.JSON(http.StatusOK, a)
+}
+
+func DeleteAsset(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+	id := c.Param("id")
+
+	var a model.Asset
+	if err := DB.Where("id=? AND user_id=?", id, userID).First(&a).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return
+	}
+
+	// TODO: 如果未来要做引用计数，这里先减计数，不直接删对象
+	_ = minioClient.RemoveObject(c.Request.Context(), a.Bucket, a.ObjectKey, minio.RemoveObjectOptions{})
+
+	DB.Delete(&a)
+	c.Status(http.StatusNoContent)
+}
+
+type ExportRequest struct {
+	RootNodeID uint   `json:"root_node_id" binding:"required"`
+	Format     string `json:"format" binding:"required,oneof=md txt pdf"`
+}
+
+type ExportJob struct {
+	ID         string `json:"id"` // 任务ID
+	UserID     uint   `json:"user_id"`
+	RootNodeID uint   `json:"root_node_id"`
+	Format     string `json:"format"` // md/txt/pdf
+}
+
+// CreateExportHandler 接收导出请求，创建任务并推送到消息队列
+func CreateExportHandler(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+
+	var req struct {
+		RootNodeID uint   `json:"root_node_id" binding:"required"`
+		Format     string `json:"format" binding:"required,oneof=md txt pdf"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 权限检查：确认 root 节点属于该用户
+	var rootNode model.Node
+	if err := DB.Where("id = ? AND user_id = ?", req.RootNodeID, userID).First(&rootNode).Error; err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied or node not found"})
+		return
+	}
+
+	// 1. 创建数据库任务记录
+	newTask := model.ExportTask{
+		UserID:     userID,
+		JobID:      uuid.New().String(), // 生成唯一任务ID
+		RootNodeID: req.RootNodeID,
+		Format:     req.Format,
+		Status:     "pending",
+	}
+	if err := DB.Create(&newTask).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create export task in db"})
+		return
+	}
+
+	// 2. 将任务推送到 RabbitMQ
+	taskMsg, _ := json.Marshal(newTask)
+	ch := mqManager.GetChannel() // 假设你已有 mqManager
+	if ch == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Message queue is not available"})
+		return
+	}
+
+	// 假设你有一个名为 "content_export" 的队列
+	err := ch.PublishWithContext(c, "", "content_export", false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		Body:         taskMsg,
+		DeliveryMode: amqp.Persistent,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to queue export task"})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{"job_id": newTask.JobID})
+}
+
+// GetExportStatusHandler 查询导出任务状态
+func GetExportStatusHandler(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+	jobID := c.Param("jobId")
+
+	var task model.ExportTask
+	if err := DB.Where("job_id = ? AND user_id = ?", jobID, userID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":    task.Status,
+		"error_msg": task.ErrorMsg,
+	})
+}
+
+// DownloadExportHandler 下载导出的文件
+func DownloadExportHandler(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+	jobID := c.Param("jobId")
+
+	var task model.ExportTask
+	if err := DB.Where("job_id = ? AND user_id = ?", jobID, userID).First(&task).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	if task.Status != "completed" && task.Status != "done" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Export is not complete yet"})
+		return
+	}
+
+	// 从 MinIO 获取对象
+	object, err := minioClient.GetObject(c.Request.Context(), "recordings", task.OutputPath, minio.GetObjectOptions{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve file from storage"})
+		return
+	}
+	defer object.Close()
+
+	objInfo, err := object.Stat()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get file info"})
+		return
+	}
+
+	// 设置响应头，触发浏览器下载
+	filename := fmt.Sprintf("export_%s.%s", task.JobID, task.Format)
+	c.Header("Content-Disposition", "attachment; filename="+filename)
+	c.Header("Content-Type", objInfo.ContentType)
+	c.Header("Content-Length", fmt.Sprintf("%d", objInfo.Size))
+
+	// 将文件内容写入响应体
+	io.Copy(c.Writer, object)
+}
+
 func main() {
 	// 读取 JWT Secret
 	secret := os.Getenv("JWT_SECRET")
@@ -2641,7 +2934,7 @@ func main() {
 	config.MaxAge = 12 * time.Hour
 
 	r.Use(cors.New(config))
-
+	r.MaxMultipartMemory = 32 << 20 // 32MB
 	// 设置路由
 	apiV1 := r.Group("/api/v1")
 	{
@@ -2688,6 +2981,14 @@ func main() {
 			auth.PUT("/nodes/:id/move", MoveNodeHandler)
 			auth.GET("/nodes/:id/recordings", ListRecordingsForNodeHandler) // 获取个人节点下的个人录音
 
+			//富文本
+			auth.POST("/assets/upload", UploadAsset) // 上传文件
+			auth.GET("/assets/:id", GetAssetMeta)    // 获取元信息（可选）
+			auth.DELETE("/assets/:id", DeleteAsset)  // 删除（可选）
+			//导出
+			auth.POST("/exports", CreateExportHandler)
+			auth.GET("/exports/:jobId", GetExportStatusHandler)
+			auth.GET("/exports/:jobId/download", DownloadExportHandler) // 注意：这个下载路由也需要认证
 			// 个人录音 (Recordings)
 			auth.GET("/recordings", ListMyRecordingsHandler)
 			auth.POST("/recordings/upload", UploadHandler)

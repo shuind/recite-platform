@@ -6,20 +6,22 @@ services:
     container_name: language_learner_nginx
     ports:
       - "80:80"
+      - "443:443"
     volumes:
       - ./frontend/dist:/usr/share/nginx/html:ro
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      # 【新增】挂载证书和验证文件目录
+      - certbot_certs:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
     depends_on:
       - backend
     restart: always
 
   backend:
-    image: crpi-b25bglrjfsh86jh6.cn-beijing.personal.cr.aliyuncs.com/shuind/language-learner-backend:latest
+    image: crpi-b25bglrjfsh86jh6.cn-beijing.personal.cr.aliyuncs.com/shuind/recite-backend:latest
     container_name: language_learner_backend
     command: ./server
     environment:
-      - APP_ENV=prod
-      - APP_TZ=Asia/Shanghai
       - GIN_MODE=release
       - DATABASE_URL=${DATABASE_URL}
       - MINIO_ENDPOINT=${MINIO_ENDPOINT}
@@ -38,12 +40,16 @@ services:
       rabbitmq:
         condition: service_healthy # 【修改】
     restart: always
+    extra_hosts: # <--- 在这里添加
+      - "host.docker.internal:host-gateway" # <--- 添加这一行
 
   worker:
     image: crpi-b25bglrjfsh86jh6.cn-beijing.personal.cr.aliyuncs.com/shuind/language-learner-backend:latest
     container_name: language_learner_worker
     command: ./worker
     environment:
+      - APP_ENV=prog
+      - APP_TZ=Asia/Shanghai
       - DATABASE_URL=${DATABASE_URL}
       - MINIO_ENDPOINT=${MINIO_ENDPOINT}
       # 【重要】将 YOUR_SERVER_IP 替换为 39.107.57.106
@@ -62,7 +68,8 @@ services:
       rabbitmq:
         condition: service_healthy # 【修改】
     restart: always
-
+    extra_hosts: # <--- 在这里添加
+      - "host.docker.internal:host-gateway" # <--- 添加这一行
   db:
     image: postgres:14-alpine
     container_name: language_learner_db
@@ -112,8 +119,18 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+  # 【新增】Certbot 服务
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot_certs:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
 volumes:
   postgres_data:
   minio_data:
   rabbitmq_data:
+  # 【新增】为证书和验证文件创建 named volumes
+  certbot_certs:
+    name: certbot_certs
+  certbot_webroot:
+    name: certbot_webroot

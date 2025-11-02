@@ -1,0 +1,42 @@
+# backend/Dockerfile.worker
+
+# --- Stage 1: Build ---
+# 使用基于 Debian (Bullseye) 的 Go 镜像，因为它更容易安装 Chromium
+FROM golang:1.24-bullseye AS builder
+
+WORKDIR /app
+
+# 复制 go.mod 和 go.sum
+COPY go.mod go.sum ./
+
+# 下载 Go 依赖
+RUN go mod download
+
+# 复制所有源代码
+COPY . .
+
+# 编译 worker 程序
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /worker ./cmd/worker
+
+# --- Stage 2: Run ---
+# 使用一个精简的 Debian 镜像作为最终运行环境
+FROM debian:bullseye-slim
+
+# 【关键】安装 Chromium 和所有必要的依赖项
+# - chromium: 浏览器本身
+# - fonts-liberation: 解决渲染PDF时可能出现的乱码问题
+# - --no-install-recommends: 避免安装不必要的软件包，减小体积
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+    chromium \
+    fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 从构建阶段复制编译好的 worker 二进制文件
+COPY --from=builder /worker /app/worker
+
+# 容器启动时运行的命令
+# 注意：这里我们不使用 CMD，因为 docker-compose.yml 中已经指定了 command
+ENTRYPOINT ["/app/worker"]

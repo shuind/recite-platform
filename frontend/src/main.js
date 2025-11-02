@@ -9,6 +9,12 @@ import App from './App.vue'
 import router from './router'
 import { useAuthStore } from './stores/auth' // 导入 auth store
 
+import VMdEditor from '@kangc/v-md-editor'
+import '@kangc/v-md-editor/lib/style/base-editor.css'
+import githubTheme from '@kangc/v-md-editor/lib/theme/github.js'
+import '@kangc/v-md-editor/lib/theme/style/github.css'
+import Prism from 'prismjs'
+VMdEditor.use(githubTheme, { Prism })
 // --- 1. 创建应用和 Pinia 实例 ---
 const app = createApp(App)
 const pinia = createPinia()
@@ -17,6 +23,7 @@ const pinia = createPinia()
 app.use(pinia) // 先使用 Pinia，这样 store 才能被创建
 app.use(router)
 app.use(ElementPlus)
+app.use(VMdEditor) 
 
 // --- 3. 定义一个异步的启动函数 ---
 async function startApp() {

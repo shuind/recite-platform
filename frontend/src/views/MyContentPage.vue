@@ -85,24 +85,40 @@
       <!-- 【关键修改】这是唯一一个白色卡片 -->
       <div class="center-panel">
         <div v-if="selectedNode && selectedNode.node_type === 'text'" class="content-view-wrapper">
+          <!-- 头部：把可编辑标题放到 header 的左侧 -->
           <div class="center-panel-header">
-            <h2 class="filename">{{ selectedNode.title }}</h2>
+            <!-- 用 el-input 直接作为标题编辑 -->
+            <el-input
+              v-if="selectedNode && selectedNode.node_type === 'text'"
+              class="title-input"
+              v-model="selectedNode.title"
+              placeholder="输入标题"
+            />
             <div class="actions-group" v-if="canManageContent">
               <span class="save-status">{{ saveStatus }}</span>
               <el-button @click="saveContent">保存内容</el-button>
               <el-button @click="handleRenameNode(selectedNode)">重命名</el-button>
               <el-button type="danger" @click="handleDeleteNode(selectedNode)">删除</el-button>
               <el-button type="primary" @click="openPublishDialog" v-if="isOwnerOfAnyDomain">发布到圈子...</el-button>
+              <el-button @click="triggerUploadImage">上传图片</el-button>
+              <el-button @click="openExportDialog">导出</el-button>
             </div>
           </div>
+
+          <!-- 【UI优化】沉浸式编辑区 -->
           <div class="editor-area">
-            <el-input
-              v-model="selectedNode.content"
-              type="textarea"
-              placeholder="在这里输入或粘贴你的朗读材料..."
-              @input="onContentChange"
-            />
+              <!-- 【修改】移除 el-tabs -->
+              <!-- 直接放置 v-md-editor，并添加图片上传的处理器 -->
+              <v-md-editor
+                ref="mdRef"
+                v-model="selectedNode.content"
+                class="md-editor"
+                @change="onContentChange"
+                @upload-image="handleImageUpload"  
+              />
           </div>
+
+
           <div class="practice-area"> 
               <div class="recording-controls">
                   <!-- 【关键修改】绑定所有的 props 和 events -->
@@ -285,6 +301,30 @@
         </span>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="exportDialog.visible" title="导出内容" width="30%" destroy-on-close>
+    <p>
+      将从 <strong>"{{ selectedNode?.title }}"</strong> 开始，递归导出所有子内容。
+    </p>
+    <el-form>
+      <el-form-item label="导出格式">
+        <el-select v-model="exportDialog.format" placeholder="请选择格式">
+          <el-option label="Markdown (.md)" value="md" />
+          <el-option label="纯文本 (.txt)" value="txt" />
+          <!-- PDF 导出通常需要后端支持强大库，这里先作为选项 -->
+          <el-option label="PDF (.pdf)" value="pdf" />
+        </el-select>
+      </el-form-item>
+    </el-form>
+    <template #footer>
+      <span class="dialog-footer">
+        <el-button @click="exportDialog.visible = false">取消</el-button>
+        <el-button type="primary" @click="confirmExport" :loading="exportDialog.loading">
+          {{ exportDialog.loading ? '正在处理中...' : '开始导出' }}
+        </el-button>
+      </span>
+    </template>
+  </el-dialog>
   </div>
   
 </template>
@@ -301,6 +341,8 @@ import {
   Folder, Document, FolderAdd, DocumentAdd, Search, 
   ArrowLeft, ArrowRight, MoreFilled ,Loading
 } from '@element-plus/icons-vue';
+
+
 // --- 录音控制相关状态和逻辑 ---
 
 // 1. 核心状态变量
@@ -598,19 +640,37 @@ const handleDeleteNode = (node) => {
   }).catch(() => {});
 };
 
+const assetUrls = computed({
+  get: () => Array.isArray(selectedNode.value?.asset_urls) ? selectedNode.value.asset_urls : [],
+  set: (v) => { selectedNode.value.asset_urls = v; onContentChange(); }
+});
+
+/** @param {{ url: string }} res */   // <<< 这是 JSDoc，可要可不要
+const onAssetUploaded = (res) => {
+  if (res && res.url) {
+    assetUrls.value = [...assetUrls.value, res.url]
+  }
+}
+
+// 保存逻辑：把 content_type/code_lang/asset_urls 一起提交
 const saveContent = async () => {
   if (!selectedNode.value) return;
   saveStatus.value = '正在保存...';
   try {
-    await apiClient.put(`/nodes/${selectedNode.value.id}`, { content: selectedNode.value.content });
+    await apiClient.put(`/nodes/${selectedNode.value.id}`, {
+      content: selectedNode.value.content,
+      content_type: selectedNode.value.content_type,
+      code_lang: selectedNode.value.code_lang,
+      asset_urls: assetUrls.value,
+    });
     saveStatus.value = '已保存';
-  } catch (error) { 
+  } catch {
     saveStatus.value = '保存失败!';
-    ElMessage.error('保存失败'); 
   } finally {
-    setTimeout(() => { saveStatus.value = ''; }, 2000);
+    setTimeout(() => saveStatus.value = '', 1500);
   }
 };
+
 
 const debouncedSave = debounce(saveContent, 5000);
 
@@ -833,378 +893,443 @@ const retryTranscribe = async (recording) => {
     }
 }
 
+// 【新增】导出功能的状态管理
+const exportDialog = reactive({
+  visible: false,
+  format: 'md',    // 默认格式
+  loading: false,  // 是否正在导出中
+  jobId: null,     // 后端返回的任务ID
+});
+// 1. 打开导出对话框
+const openExportDialog = () => {
+  if (!selectedNode.value) {
+    ElMessage.warning('请先从左侧选择一个要导出的文件或文件夹。');
+    return;
+  }
+  exportDialog.visible = true;
+  exportDialog.loading = false;
+  exportDialog.format = 'md'; // 重置
+};
+// 2. 确认导出，向后端发起请求
+const confirmExport = async () => {
+  if (!selectedNode.value) return;
+
+  exportDialog.loading = true;
+  try {
+    // 假设后端接口为 POST /exports
+    const response = await apiClient.post('/exports', {
+      root_node_id: selectedNode.value.id, // 告诉后端从哪个节点开始
+      format: exportDialog.format,         // 告诉后端导出的格式
+    });
+    
+    // 后端应返回一个任务 ID，用于后续查询状态
+    const jobId = response.data.job_id;
+    if (jobId) {
+        ElMessage.info('导出任务已创建，正在后台处理...');
+        exportDialog.visible = false;
+        pollExportStatus(jobId); // 开始轮询任务状态
+    } else {
+        throw new Error("后端未返回任务ID");
+    }
+
+  } catch (error) {
+    console.error('发起导出失败:', error);
+    ElMessage.error(error.response?.data?.error || '发起导出失败，请稍后重试。');
+    exportDialog.loading = false;
+  }
+};
+
+// 3. 轮询导出任务状态
+const pollExportStatus = (jobId) => {
+  const timer = setInterval(async () => {
+    try {
+      // 假设后端状态查询接口为 GET /exports/{jobId}
+      const response = await apiClient.get(`/exports/${jobId}`);
+      const status = response.data.status;
+
+      if (status === 'completed') {
+        clearInterval(timer);
+        ElMessage.success('导出成功！即将开始下载...');
+        // 后端应提供一个下载链接
+        window.location.href = response.data.download_url; 
+        // 或者直接是 /api/exports/{jobId}/download
+      } else if (status === 'failed') {
+        clearInterval(timer);
+        ElMessage.error(response.data.error_message || '导出任务失败！');
+      }
+      // 如果 status 是 'processing' 或 'pending'，则什么都不做，继续等待下一次轮询
+
+    } catch (error) {
+      clearInterval(timer);
+      console.error('轮询导出状态失败:', error);
+      ElMessage.error('无法获取导出状态，请检查网络或联系管理员。');
+    }
+  }, 3000); // 每3秒查询一次
+};
+
+// 【新增】处理 v-md-editor 的图片上传事件
+const handleImageUpload = async (event, insertImage, files) => {
+  // `files` 是一个 File 对象数组，我们处理第一个
+  if (!files.length) return;
+  const file = files[0];
+
+  // 1. 创建 FormData 用于上传
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    // 2. 调用您已有的统一资源上传接口
+    const response = await apiClient.post('/assets/upload', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+
+    const imageUrl = response.data.url;
+    if (!imageUrl) {
+      throw new Error('Upload succeeded but no URL was returned.');
+    }
+
+    // 3. 【关键】使用 v-md-editor 提供的回调函数插入图片
+    // 这会在编辑器的光标位置插入 ![file.name](imageUrl)
+    insertImage({
+      url: imageUrl,
+      desc: file.name, // 图片的 alt 文本，默认为文件名
+      // width: 'auto',
+      // height: 'auto',
+    });
+    ElMessage.success('图片上传成功！');
+
+  } catch (error) {
+    console.error('图片上传失败:', error);
+    ElMessage.error('图片上传失败，请检查网络或联系管理员。');
+  }
+};
+
+const mdRef = ref(null);
+
+const insertAtCursor = (md) => {
+  const textarea =
+    mdRef.value?.$el?.querySelector?.('.v-md-editor textarea') ||
+    document.querySelector('.v-md-editor textarea');
+  if (!textarea) {
+    selectedNode.value.content = (selectedNode.value.content || '') + '\n' + md + '\n';
+    return;
+  }
+  const start = textarea.selectionStart || 0;
+  const end = textarea.selectionEnd || start;
+  const val = selectedNode.value.content || '';
+  selectedNode.value.content = val.slice(0, start) + md + val.slice(end);
+  nextTick(() => {
+    const pos = start + md.length;
+    textarea.selectionStart = textarea.selectionEnd = pos;
+    textarea.focus();
+  });
+};
+
+const uploadImageFile = async (file) => {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await apiClient.post('/assets/upload', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  });
+  const url = res.data && res.data.url;
+  if (!url) throw new Error('no url');
+  return url;
+};
+
+const triggerUploadImage = () => {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.onchange = async () => {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    try {
+      const url = await uploadImageFile(file);
+      insertAtCursor(`![${file.name}](${url})`);
+      ElMessage.success('已插入图片');
+    } catch (e) {
+      ElMessage.error('图片上传失败');
+    }
+  };
+  input.click();
+};
+
+const onPaste = async (e) => {
+  if (!e.clipboardData) return;
+  const file = e.clipboardData.files && e.clipboardData.files[0];
+  if (file && file.type.startsWith('image/')) {
+    e.preventDefault();
+    try {
+      const url = await uploadImageFile(file);
+      insertAtCursor(`![${file.name}](${url})`);
+      ElMessage.success('已插入图片');
+    } catch (e) { ElMessage.error('图片上传失败'); }
+    return;
+  }
+  const text = e.clipboardData.getData('text');
+  if (text && /^https?:\/\/.+\.(png|jpe?g|gif|webp|svg)(\?.*)?$/i.test(text.trim())) {
+    e.preventDefault();
+    insertAtCursor(`![](${text.trim()})`);
+  }
+};
+
+const onDrop = async (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file && file.type.startsWith('image/')) {
+    try {
+      const url = await uploadImageFile(file);
+      insertAtCursor(`![${file.name}](${url})`);
+      ElMessage.success('已插入图片');
+    } catch (e) { ElMessage.error('图片上传失败'); }
+  }
+};
+const onDragOver = (e) => e.preventDefault();
+
+onMounted(() => {
+  nextTick(() => {
+    const editor = mdRef.value?.$el || document.querySelector('.v-md-editor');
+    if (!editor) return;
+    editor.addEventListener('paste', onPaste);
+    editor.addEventListener('drop', onDrop);
+    editor.addEventListener('dragover', onDragOver);
+  });
+});
+onUnmounted(() => {
+  const editor = mdRef.value?.$el || document.querySelector('.v-md-editor');
+  if (!editor) return;
+  editor.removeEventListener('paste', onPaste);
+  editor.removeEventListener('drop', onDrop);
+  editor.removeEventListener('dragover', onDragOver);
+});
 
 </script>
 
 <style scoped>
 /* ==========================================================================
-   核心布局修复 (基于 Flexbox)
+   核心布局 (实现沉浸式三栏)
    ========================================================================== */
 
-/* 1. 让中间面板成为一个 Flex 容器，以便其子元素可以撑满高度 */
-.center-panel {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden; /* 防止子元素溢出 */
-  /* 保留您原有的卡片样式 */
-  flex: 1 1 auto;
-  background-color: #fff;
-  border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-}
-
-/* 2. 让内容包裹器撑满中间面板 */
-.content-view-wrapper { 
-  flex: 1 1 auto; 
-  min-height: 0; 
-  display: flex; 
-  flex-direction: column; 
-}
-
-/* 3. 【解决问题一】让文本编辑区自动伸展 */
-.editor-area {
-  flex-grow: 1; /* 核心：占据所有剩余的垂直空间 */
-  min-height: 200px; /* 保证一个最小的可视高度 */
-  padding: 16px;
-  display: flex; /* 让内部的 el-input 也撑满 */
-}
-
-/* 穿透 el-input 组件样式，让 textarea 元素真正撑满其父容器(.editor-area) */
-:deep(.editor-area .el-textarea),
-:deep(.editor-area .el-textarea__inner) {
-  height: 100%;
-  border: none;
-  box-shadow: none;
-  padding: 0;
-  resize: none;
-  background-color: transparent;
-  font-size: 16px;
-  line-height: 1.7;
-}
-
-
-/* 4. 【解决问题二】让录音区高度固定且内部可滚动 */
-.recording-section {
-  /* 1. 让整个录音区成为一个垂直方向的 Flex 容器 */
-  display: flex;
-  flex-direction: column;
-  
-  /* 2. 高度保持不变，让子元素来分配这个高度 */
-  height: 400px; /* 您可以根据需要调整这个总高度 */
-  border-top: 1px solid #eee;
-}
-
-
-.recording-section .recording-controls {
-  padding: 16px;
-  flex-shrink: 0; /* 控件区域高度固定 */
-}
-
-.recording-section h3 {
-  margin: 0 0 16px 0;
-  font-size: 16px;
-  padding: 0 16px;
-  flex-shrink: 0;
-}
-
-.history-list { flex: 1 1 auto; min-height: 0; padding: 0 16px 16px; }
-:deep(.el-table) { height: 100%; }
-:deep(.el-table__body-wrapper) { max-height: 100%; overflow: auto; }
-.recording-actions {
-  display: flex;
-  align-items: center; /* 垂直居中 */
-  justify-content: space-between; /* 播放器和按钮组两端对齐 */
-  width: 100%;
-}
-.action-buttons {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0; /* 防止按钮被压缩 */
-  margin-left: 10px;
-}
-/* 1280 以下：默认收起右侧 AI 面板；1100 以下：收起左侧面板 */
-@media (max-width: 1280px) {
-  .content-layout-container.with-right { padding-right: 16px; } /* 右侧展开时也不挤压中间 */
-}
-@media (max-width: 1100px) {
-  .left-panel { flex-basis: 0; opacity: 0; }
-  .left-panel-toggle { left: 0; }
-}
-
-/* ==========================================================================
-   保留您其他的样式 (头部、按钮组、右键菜单等)
-   ========================================================================== */
-.my-content-page, .content-layout-container, .left-panel, .right-panel,
-.panel-header, .panel-content, .panel-search, .panel-actions, .panel-tree,
-.tree-scrollbar, .custom-tree, :deep(.custom-tree .el-tree-node__content),
-:deep(.custom-tree .el-tree-node.is-current > .el-tree-node__content),
-.custom-tree-node .el-icon, .left-panel-toggle, .center-panel-header,
-.filename, .actions-group, .save-status,  .context-menu,
-.menu-item, .menu-separator, .search-results, .search-result-item,
-.search-empty, .ai-assistant, .chat-history, .chat-message, .message-bubble,
-.loading-bubble, .chat-input, .recording-actions, .left-panel.collapsed, 
-.left-panel-toggle.collapsed
- {
-  /* 这里粘贴您提供的所有其他样式，确保它们保持不变 */
-  /* 为节省篇幅，此处省略，请将您原有的、与核心布局无关的样式代码复制到这里 */
-}
-.right-panel.collapsed {
-  transform: translateX(100%);
-  opacity: 0;
-  pointer-events: none;
-}
-/* 中间容器在右侧展开时预留内边距，避免被 fixed 面板遮挡 */
-.content-layout-container.with-right {
-  padding-right: calc(var(--right-panel-w) + 16px);
-}
-.right-panel-toggle {
-  position: fixed;
-  top: calc(var(--header-h) + 8px);
-  right: 24px;
-  z-index: 100;
-}
-/* --- 您可以从这里开始，将您原有样式中除了上面已修正的部分，全部粘贴过来 --- */
-/*
- *  【全新修正的样式】
- *  这部分代码实现了您描述的沉浸式布局
- */
-
+/* 页面总容器，使用 Flex 撑满视口 */
 .my-content-page {
-  /* 使用 Flexbox 布局 */
   display: flex;
-  flex-direction: column; /* 垂直排列子元素 */
-  
-  /* 占据所有可用空间 */
-  width: 100%;
-  height: 100%; /* 这个 height: 100% 很关键 */
-  
-  position: relative; /* 为内部的 fixed/absolute 定位提供上下文 */
-  /*overflow: hidden;  隐藏内部可能产生的滚动条 */
+  height: 100%;
+  padding: 16px;
+  box-sizing: border-box;
+  background-color: #f0f2f5; /* 整个页面的浅灰色背景，类似 CSDN */
 }
 
+/* 布局主容器 */
 .content-layout-container {
   flex: 1;
   display: flex;
-  height: 100%;
-  overflow: hidden;
-  padding: 16px;
-  padding-top: 0;
-  gap: 16px;
-  max-width: 1580px; 
+  gap: 16px; /* 面板之间的间距 */
   position: relative;
+  overflow: hidden;
 }
 
-/* 面板通用样式 */
-.left-panel {
-  flex: 0 0 var(--left-panel-w);
-  background: transparent;
-  overflow: hidden;
-  transition: flex-basis .25s ease, opacity .25s ease;
-}
+/* 左右面板通用样式 (透明背景) */
 .left-panel, .right-panel {
   display: flex;
   flex-direction: column;
+  background-color: transparent; /* 关键：使其融入页面背景 */
   transition: all 0.3s ease-in-out;
-  overflow: hidden;
-}
-.panel-header {
-  flex-shrink: 0; 
-  padding: 16px;
-  padding-bottom: 8px;
-}
-.panel-header h3 {
-  margin: 0;
-  font-size: 18px;
-  font-weight: 600;
-  color: #333;
-}
-.panel-content {
-  flex-grow: 1;
-  min-height: 0; 
-  display: flex;
-  flex-direction: column;
 }
 
-/* 左侧面板完全融入背景 */
+/* 左侧面板 */
 .left-panel {
-  flex: 0 0 300px;
-  background-color: transparent; 
+  flex: 0 0 300px; /* 固定宽度 */
 }
 .left-panel.collapsed {
   flex-basis: 0;
   min-width: 0;
   opacity: 0;
+  margin-right: -16px; /* 收起时消除 gap 影响 */
 }
-.left-panel .panel-header, .left-panel .panel-content {
-  background-color: transparent; 
-  border: none;
-  padding-left: 0;
-  padding-right: 0;
-}
-.left-panel .panel-search, .left-panel .panel-actions { flex-shrink: 0; padding: 8px; }
-.left-panel .panel-actions .el-button { width: 100%; margin: 4px 0 !important; }
-.left-panel .panel-tree { flex-grow: 1; }
-.tree-scrollbar { height: 100%; }
-.custom-tree, :deep(.custom-tree .el-tree-node__content) {
-  background-color: transparent;
-}
-:deep(.custom-tree .el-tree-node.is-current > .el-tree-node__content) {
-  background-color: rgba(64, 158, 255, 0.1); 
-}
-.custom-tree-node .el-icon { margin-right: 8px; }
 
+/* 中间主内容区 (白色卡片) */
+.center-panel {
+  flex: 1;
+  display: flex; /* 让内部元素也能使用 Flex */
+  flex-direction: column;
+  background-color: #fff; /* 关键：白色卡片背景 */
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.08); /* 添加阴影提升质感 */
+  overflow: hidden; /* 防止内容溢出圆角 */
+}
 
-/* 右侧 AI 助手面板也融入背景 */
+/* 右侧 AI 助手 */
 .right-panel {
-  position: fixed;
-  right: 0;
   flex: 0 0 350px;
-  height: calc(100vh - 76px);
-  width: 410px;
-  background-color: transparent;
 }
-.right-panel.collapsed { 
+.right-panel.collapsed {
   flex-basis: 0;
   min-width: 0;
-  padding: 0;
-  margin-left: -16px; 
   opacity: 0;
+  margin-left: -16px;
 }
-.right-panel .panel-header, .right-panel .panel-content {
-  background-color: transparent;
+
+
+/* ==========================================================================
+   中间编辑区优化 (实现 CSDN 风格的沉浸式编辑)
+   ========================================================================== */
+
+/* 内容包裹器，使用 Flex 撑满中间面板 */
+.content-view-wrapper {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.editor-area {
+  flex: 1 1 auto;     /* 占据剩余空间 */
+  min-height: 0;      /* 允许被压缩，防止溢出 */
+  display: flex;      /* 关键：用 flex 来分配高度 */
+  padding: 24px;
+}
+
+/* 让 el-tabs 和其内容也撑满 */
+:deep(.editor-area .el-tabs),
+:deep(.editor-area .el-tabs__content),
+:deep(.editor-area .el-tab-pane) {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* 穿透修改内部组件样式，让它们真正“沉浸” */
+:deep(.editor-area .el-textarea),
+:deep(.editor-area .el-textarea__inner) {
+  flex: 1; /* 关键：让 textarea 自身也撑满 */
   border: none;
+  box-shadow: none;
+  padding: 0;
+  resize: none;
+  background-color: transparent;
+  font-size: 16px; /* 提升写作体验 */
+  line-height: 1.7;
+}
+
+/* 让 v-md-editor 用 flex 规则填满父容器，而不是依赖 height:100% */
+:deep(.editor-area .v-md-editor) {
+  flex: 1 1 0;        /* 高度随父容器分配 */
+  min-height: 0;
+  height: auto;       /* 避免百分比高度为 0 的问题 */
+  width: 100%;
+  box-sizing: border-box;
 }
 
 
-/* 左侧折叠按钮基于变量定位 */
-.left-panel-toggle {
-  position: absolute;
-  top: 50%;
-  left: calc(var(--left-panel-w) - 16px); /* 与面板边缘贴边，16px为按钮宽度的一半微调 */
-  transform: translateY(-50%);
-  width: 24px;
-  height: 48px;
-  background: #f0f2f5;
-  border: 1px solid #dcdfe6;
-  border-left: none;
-  border-top-right-radius: 6px;
-  border-bottom-right-radius: 6px;
-  display: flex; align-items: center; justify-content: center;
-  cursor: pointer; z-index: 10;
-  transition: left .25s ease, background-color .2s ease;
-  box-shadow: 2px 0 5px rgba(0,0,0,0.04);
-}
-.left-panel-toggle:hover {
-  background-color: #e9e9eb;
-}
-.left-panel-toggle.collapsed {
-    left: 0px; 
-    border-left: 1px solid #dcdfe6;
+:deep(.editor-area .v-md-editor .v-md-editor__editor-wrapper) {
+  border-right: 1px solid #e8e8e8;
 }
 
-/* 中间面板头部 */
-.center-panel-header { display: flex; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid #eee; flex-shrink: 0; }
-.filename { margin: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; }
-.filename .el-icon { margin-right: 8px; }
+
+/* ==========================================================================
+   其他区域样式 (保持不变或微调)
+   ========================================================================== */
+
+.panel-header {
+  padding: 16px;
+  flex-shrink: 0;
+}
+.panel-header h3 { margin: 0; }
+.panel-content {
+  flex-grow: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px 16px;
+}
+.panel-actions { margin-bottom: 10px; }
+.panel-actions .el-button { width: 100%; margin: 4px 0 !important; }
+.panel-tree { flex: 1; min-height: 0; }
+.tree-scrollbar { height: 100%; }
+.custom-tree, :deep(.custom-tree .el-tree-node__content) { background-color: transparent; }
+:deep(.custom-tree .el-tree-node.is-current > .el-tree-node__content) { background-color: rgba(64, 158, 255, 0.1); }
+
+.center-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 16px 24px;
+  border-bottom: 1px solid #eee;
+  flex-shrink: 0;
+}
+/* 让标题输入框更有设计感 */
+.title-input {
+  font-size: 24px;
+  font-weight: 600;
+}
+:deep(.title-input .el-input__wrapper) {
+  box-shadow: none !important;
+  padding: 0;
+}
+:deep(.title-input .el-input__inner) {
+  height: auto;
+  line-height: inherit;
+  font-family: inherit;
+  font-weight: inherit;
+  color: #303133;
+}
 .actions-group { display: flex; align-items: center; gap: 10px; }
 
 
-/* 右侧面板开关按钮 */
-.right-panel {
-  position: fixed;
-  top: var(--header-h);
-  right: 0;
-  width: var(--right-panel-w);
-  height: calc(100vh - var(--header-h));
-  background-color: transparent;
+/* 录音区 */
+.practice-area {
+  padding: 16px 24px;
+  border-top: 1px solid #eee;
+}
+.recording-section {
+  height: 300px; /* 固定一个高度 */
   display: flex;
   flex-direction: column;
-  transition: opacity .25s ease, transform .25s ease;
-  will-change: transform, opacity;
+  border-top: 1px solid #eee;
+  padding: 16px 24px;
 }
+.recording-section h3 { margin: 0 0 10px 0; }
+.history-list { flex: 1; min-height: 0; }
 
-/* 其他样式 */
+
+/* --- 保留你原有的其他样式，如右键菜单、AI助手等 --- */
+.left-panel-toggle { position: absolute; top: 50%; left: 300px; transform: translateY(-50%); z-index: 10; cursor: pointer; background: #fff; border: 1px solid #dcdfe6; border-radius: 0 50% 50% 0; width: 24px; height: 48px; display: flex; align-items: center; justify-content: center; box-shadow: 2px 0 5px rgba(0,0,0,0.05); transition: all .3s ease; }
+.left-panel-toggle.collapsed { left: 0; border-radius: 0 6px 6px 0; }
+.right-panel-toggle { position: fixed; top: 80px; right: 24px; z-index: 1001; }
 .context-menu { position: fixed; background: white; border: 1px solid #ccc; box-shadow: 0 2px 10px rgba(0,0,0,0.1); border-radius: 4px; z-index: 1000; padding: 5px 0; }
 .menu-item { font-size: 14px; padding: 8px 15px; cursor: pointer; }
 .menu-item:hover { background-color: #ecf5ff; color: #409eff; }
 .menu-separator { border-top: 1px solid #eee; margin: 5px 0; }
-.search-results { padding: 10px; }
-.search-result-item { padding: 8px 12px; cursor: pointer; display: flex; align-items: center; border-radius: 4px; }
-.search-result-item:hover { background-color: rgba(0,0,0,0.04); }
-.search-result-item .el-icon { margin-right: 8px; }
-.search-empty { color: #909399; text-align: center; padding: 20px; }
+.ai-assistant, .chat-history, .chat-message, .message-bubble, .chat-input { /* 你的样式... */ }
 
-/* AI 助手特定样式 */
-.ai-assistant {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-.chat-history {
-  flex-grow: 1;
-  padding: 10px;
-  overflow-y: auto;
-}
-.chat-message {
-  display: flex;
-  margin-bottom: 15px;
-}
-.chat-message.user {
-  justify-content: flex-end;
-}
-.chat-message.assistant {
-  justify-content: flex-start;
-}
-.message-bubble {
-  max-width: 80%;
-  padding: 10px 15px;
-  border-radius: 18px;
-  line-height: 1.5;
-}
-.chat-message.user .message-bubble {
-  background-color: #409eff;
-  color: white;
-  border-bottom-right-radius: 4px;
-}
-.chat-message.assistant .message-bubble {
-  background-color: #f0f2f5;
-  color: #333;
-  border-bottom-left-radius: 4px;
-}
-.loading-bubble {
-    animation: blink 1.5s infinite;
-}
-@keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.5; }
-}
+.ai-assistant { display: flex; flex-direction: column; height: 100%; }
+.chat-history { flex-grow: 1; padding: 10px; overflow-y: auto; }
+.chat-message { display: flex; margin-bottom: 15px; }
+.chat-message.user { justify-content: flex-end; }
+.chat-message.assistant { justify-content: flex-start; }
+.message-bubble { max-width: 80%; padding: 10px 15px; border-radius: 18px; line-height: 1.5; }
+.chat-message.user .message-bubble { background-color: #409eff; color: white; border-bottom-right-radius: 4px; }
+.chat-message.assistant .message-bubble { background-color: #f0f2f5; color: #333; border-bottom-left-radius: 4px; }
+.loading-bubble { animation: blink 1.5s infinite; }
+@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.chat-input { flex-shrink: 0; padding: 10px; border-top: 1px solid #e4e7ed; }
 
-.chat-input {
-  flex-shrink: 0;
-  padding: 10px;
-  border-top: 1px solid #e4e7ed;
-}
 
-.recognition-text-popover p {
-  margin: 0;
-  padding: 5px;
-  line-height: 1.7;
-  font-size: 14px;
-  color: #333;
-  white-space: pre-wrap; /* 保持文本换行 */
-  max-height: 300px; /* 防止文本过长 */
-  overflow-y: auto;
+.save-status {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;            /* 固定高度，避免把 header 顶高 */
+  padding: 0 8px;
+  border-radius: 4px;
+  background: #f5f7fa;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1;          /* 防止文字行高拉伸 */
+  white-space: nowrap;     /* 不换行，避免竖排堆字 */
+  writing-mode: horizontal-tb;  /* 强制横排，防止继承到竖排 */
+  min-width: 72px;         /* 可选：宽度稳定一点 */
 }
-
-.status-indicator {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: #909399;
-    font-size: 12px;
-}
-.status-indicator .el-icon {
-    margin-right: 4px;
-}
-
 </style>
