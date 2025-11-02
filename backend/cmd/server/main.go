@@ -2644,6 +2644,38 @@ type Asset struct {
 	SHA256    string `gorm:"index" json:"sha256"`
 }
 
+func deriveBaseURL(c *gin.Context) string {
+	scheme := "http"
+	if proto := c.Request.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if c.Request.TLS != nil {
+		scheme = "https"
+	}
+
+	host := c.Request.Host
+	if forwardedHost := c.Request.Header.Get("X-Forwarded-Host"); forwardedHost != "" {
+		host = forwardedHost
+	}
+	if host == "" {
+		host = os.Getenv("APP_PUBLIC_HOST")
+	}
+	if host == "" {
+		host = "localhost"
+	}
+
+	return fmt.Sprintf("%s://%s", scheme, host)
+}
+
+func buildPublicAssetURL(c *gin.Context, assetID uint, bucket, objectKey string) string {
+	if publicEndpoint := strings.TrimSpace(os.Getenv("MINIO_PUBLIC_ENDPOINT")); publicEndpoint != "" {
+		publicEndpoint = strings.TrimRight(publicEndpoint, "/")
+		return fmt.Sprintf("%s/%s/%s", publicEndpoint, bucket, objectKey)
+	}
+
+	base := strings.TrimRight(deriveBaseURL(c), "/")
+	return fmt.Sprintf("%s/api/v1/assets/%d/raw", base, assetID)
+}
+
 // UploadAsset 统一上传资产到 MinIO（图片/附件）
 func UploadAsset(c *gin.Context) {
 	userID := c.MustGet("userID").(uint)
@@ -2655,14 +2687,12 @@ func UploadAsset(c *gin.Context) {
 	}
 	defer file.Close()
 
-	// 限流/上限（20MB）
 	buf, err := io.ReadAll(io.LimitReader(file, 20<<20))
 	if err != nil {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "file too large"})
 		return
 	}
 
-	// MIME 检测
 	mime := http.DetectContentType(buf)
 	allowed := map[string]bool{
 		"image/png": true, "image/jpeg": true, "image/gif": true, "image/webp": true,
@@ -2674,7 +2704,6 @@ func UploadAsset(c *gin.Context) {
 		return
 	}
 
-	// SHA256 去重（同一用户）
 	sum := sha256.Sum256(buf)
 	sha := fmt.Sprintf("%x", sum[:])
 
@@ -2684,7 +2713,6 @@ func UploadAsset(c *gin.Context) {
 		return
 	}
 
-	// object key
 	ext := ""
 	if i := strings.LastIndex(hdr.Filename, "."); i >= 0 {
 		ext = strings.ToLower(hdr.Filename[i:])
@@ -2692,13 +2720,11 @@ func UploadAsset(c *gin.Context) {
 	bucket := os.Getenv("MINIO_BUCKET")
 	if bucket == "" {
 		bucket = "recordings"
-	} // 兼容你现有
+	}
 	objectKey := fmt.Sprintf("assets/%d/%d_%s%s", userID, time.Now().UnixNano(), generateRandomString(6), ext)
 
-	// 关键：传入 context.Context
 	ctx := c.Request.Context()
 
-	// 上传
 	reader := bytes.NewReader(buf)
 	_, err = minioClient.PutObject(ctx, bucket, objectKey, reader, int64(len(buf)), minio.PutObjectOptions{
 		ContentType: mime,
@@ -2708,36 +2734,40 @@ func UploadAsset(c *gin.Context) {
 		return
 	}
 
-	// 公网 URL：优先使用 MINIO_PUBLIC_ENDPOINT（没有就回退 MINIO_ENDPOINT + scheme）
-	publicEndpoint := os.Getenv("MINIO_PUBLIC_ENDPOINT")
-	if publicEndpoint == "" {
-		endpoint := os.Getenv("MINIO_ENDPOINT")
-		useSSL := os.Getenv("MINIO_USE_SSL") == "true"
-		scheme := "http"
-		if useSSL {
-			scheme = "https"
-		}
-		publicEndpoint = fmt.Sprintf("%s://%s", scheme, endpoint)
-	}
-	url := fmt.Sprintf("%s/%s/%s", publicEndpoint, bucket, objectKey)
-
+	// 1. 先创建 asset 记录，此时 URL 为空
 	asset := model.Asset{
 		UserID:    userID,
 		Bucket:    bucket,
 		ObjectKey: objectKey,
-		URL:       url,
+		URL:       "", // 暂时为空
 		MimeType:  mime,
 		SizeBytes: int64(len(buf)),
 		SHA256:    sha,
 	}
 	if err := DB.Create(&asset).Error; err != nil {
+		// 如果数据库保存失败，最好也从 MinIO 删除已上传的对象，防止产生孤儿文件
+		_ = minioClient.RemoveObject(ctx, bucket, objectKey, minio.RemoveObjectOptions{})
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "db save failed"})
 		return
 	}
 
+	// 2. 现在 asset.ID 已经由数据库生成，用它来构建正确的 URL
+	url := buildPublicAssetURL(c, asset.ID, bucket, objectKey)
+
+	// 3. 将正确的 URL 更新回数据库
+	if err := DB.Model(&asset).Update("url", url).Error; err != nil {
+		// 处理更新失败的情况
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update asset url"})
+		return
+	}
+	// 4. 同时更新内存中的对象，以便在响应中返回正确的 URL
+	asset.URL = url
+
 	c.JSON(http.StatusOK, gin.H{
-		"id": asset.ID, "url": asset.URL,
-		"mime_type": asset.MimeType, "size": asset.SizeBytes,
+		"id":        asset.ID,
+		"url":       asset.URL,
+		"mime_type": asset.MimeType,
+		"size":      asset.SizeBytes,
 	})
 }
 
@@ -2751,7 +2781,50 @@ func GetAssetMeta(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, a)
 }
+func ServeAsset(c *gin.Context) {
+	userID := c.MustGet("userID").(uint)
+	idParam := c.Param("id")
+	assetID, err := strconv.ParseUint(idParam, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid asset id"})
+		return
+	}
 
+	var asset model.Asset
+	if err := DB.First(&asset, assetID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "asset not found"})
+		return
+	}
+
+	if asset.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "permission denied"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	object, err := minioClient.GetObject(ctx, asset.Bucket, asset.ObjectKey, minio.GetObjectOptions{})
+	if err != nil {
+		log.Printf("ServeAsset: failed to get object %s/%s: %v", asset.Bucket, asset.ObjectKey, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch asset"})
+		return
+	}
+	defer object.Close()
+
+	info, err := object.Stat()
+	if err != nil {
+		log.Printf("ServeAsset: failed to stat object %s/%s: %v", asset.Bucket, asset.ObjectKey, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to fetch asset"})
+		return
+	}
+
+	c.Header("Content-Type", asset.MimeType)
+	c.Header("Content-Length", fmt.Sprintf("%d", info.Size))
+	c.Status(http.StatusOK)
+
+	if _, err := io.Copy(c.Writer, object); err != nil {
+		log.Printf("ServeAsset: failed to stream object %s/%s: %v", asset.Bucket, asset.ObjectKey, err)
+	}
+}
 func DeleteAsset(c *gin.Context) {
 	userID := c.MustGet("userID").(uint)
 	id := c.Param("id")
@@ -2984,6 +3057,7 @@ func main() {
 			//富文本
 			auth.POST("/assets/upload", UploadAsset) // 上传文件
 			auth.GET("/assets/:id", GetAssetMeta)    // 获取元信息（可选）
+			auth.GET("/assets/:id/raw", ServeAsset)  // 读取文件内容
 			auth.DELETE("/assets/:id", DeleteAsset)  // 删除（可选）
 			//导出
 			auth.POST("/exports", CreateExportHandler)

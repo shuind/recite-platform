@@ -13,6 +13,7 @@ services:
       - APP_TZ=Asia/Shanghai
       - DATABASE_URL=postgres://user:password@db:5432/mydatabase?sslmode=disable
       - MINIO_ENDPOINT=minio:9000
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:9000 # <-- 这是给浏览器用的
       - MINIO_ACCESS_KEY=youraccesskey
       - MINIO_SECRET_KEY=yoursecretkey
       - MINIO_USE_SSL=false
