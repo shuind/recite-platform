@@ -293,7 +293,7 @@ func initDB() {
 	}
 
 	// 自动迁移模型，这部分保持不变
-	err = DB.AutoMigrate(&model.TaskItem{}, &model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{})
+	err = DB.AutoMigrate(&model.TaskItem{}, &model.User{}, &model.Text{}, &model.Recording{}, &model.Node{}, &model.Domain{}, &model.DomainMember{}, &model.DomainNode{}, &model.Like{}, &model.Follower{}, &model.Post{}, &model.Reply{}, &model.DomainNodeComment{}, &model.PostLike{}, &model.ReplyLike{}, &model.Message{}, &model.QuestionFollow{}, &model.Comment{})
 	if err != nil {
 		log.Fatalf("Failed to auto migrate: %v", err)
 	}
@@ -2064,103 +2064,6 @@ func generateRandomString(length int) string {
 	return string(b)
 }
 
-// === FollowUserHandler 关注一个用户 ===
-func FollowUserHandler(c *gin.Context) {
-	// 1. 获取 ID
-	// a. followerID 是当前操作者，从中间件获取
-	followerID_interface, _ := c.Get("userID")
-	followerID := followerID_interface.(uint)
-
-	// b. followingID 是被关注者，从 URL 参数获取
-	followingID_str := c.Param("id")
-	followingID_uint64, err := strconv.ParseUint(followingID_str, 10, 32)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid user ID"})
-		return
-	}
-	followingID := uint(followingID_uint64)
-
-	// 2. 业务规则校验
-	if followerID == followingID {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "You cannot follow yourself"})
-		return
-	}
-
-	// 3. 【核心】使用数据库事务执行操作
-	err = DB.Transaction(func(tx *gorm.DB) error {
-		// a. 创建关注关系记录
-		follow := model.Follower{
-			FollowerID:  followerID,
-			FollowingID: followingID,
-		}
-		// 使用 OnConflict Do Nothing 避免重复关注时报错，实现幂等性
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&follow).Error; err != nil {
-			return err // 返回错误，事务将回滚
-		}
-
-		// 如果上面 Create 成功 (RowsAffected > 0)，才更新计数
-		if tx.RowsAffected > 0 {
-			// b. 增加关注者的 following_count
-			if err := tx.Model(&model.User{}).Where("id = ?", followerID).UpdateColumn("following_count", gorm.Expr("following_count + 1")).Error; err != nil {
-				return err
-			}
-			// c. 增加被关注者的 followers_count
-			if err := tx.Model(&model.User{}).Where("id = ?", followingID).UpdateColumn("followers_count", gorm.Expr("followers_count + 1")).Error; err != nil {
-				return err
-			}
-		}
-
-		return nil // 返回 nil，事务将提交
-	})
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to follow user", "details": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Followed successfully"})
-}
-
-// === UnfollowUserHandler 取消关注一个用户 ===
-func UnfollowUserHandler(c *gin.Context) {
-	// 1. 获取 ID (同上)
-	followerID_interface, _ := c.Get("userID")
-	followerID := followerID_interface.(uint)
-	followingID_str := c.Param("id")
-	followingID_uint64, _ := strconv.ParseUint(followingID_str, 10, 32)
-	followingID := uint(followingID_uint64)
-
-	// 2. 使用事务执行操作
-	err := DB.Transaction(func(tx *gorm.DB) error {
-		// a. 删除关注关系记录
-		result := tx.Where("follower_id = ? AND following_id = ?", followerID, followingID).Delete(&model.Follower{})
-		if result.Error != nil {
-			return result.Error
-		}
-
-		// 只有在确实删除了记录 (之前是关注状态) 的情况下，才更新计数
-		if result.RowsAffected > 0 {
-			// b. 减少关注者的 following_count
-			if err := tx.Model(&model.User{}).Where("id = ?", followerID).UpdateColumn("following_count", gorm.Expr("GREATEST(0, following_count - 1)")).Error; err != nil {
-				return err
-			}
-			// c. 减少被关注者的 followers_count
-			if err := tx.Model(&model.User{}).Where("id = ?", followingID).UpdateColumn("followers_count", gorm.Expr("GREATEST(0, followers_count - 1)")).Error; err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unfollow user", "details": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"message": "Unfollowed successfully"})
-}
-
 // GetUserProfileHandler 获取用户公开信息
 func GetUserProfileHandler(c *gin.Context) {
 	// a. 获取目标用户的 ID
@@ -2599,7 +2502,6 @@ func ListDomainNodeCommentsHandler(c *gin.Context) {
 
 	c.JSON(http.StatusOK, response)
 }
-
 func main() {
 	// 读取 JWT Secret
 	secret := os.Getenv("JWT_SECRET")
@@ -2607,7 +2509,8 @@ func main() {
 		log.Fatal("JWT_SECRET environment variable not set")
 	}
 	jwtKey = []byte(secret)
-	// 1. 初始化数据库
+
+	// 1. 初始化服务
 	initDB()
 	initMinIO()
 	mqManager = mq.NewRabbitMQManager("audio_processing")
@@ -2618,48 +2521,64 @@ func main() {
 		Logger:   log.Default(),
 		Env:      os.Getenv("APP_ENV"), // dev|prod
 		Timezone: os.Getenv("APP_TZ"),  // 默认 Asia/Shanghai
-		// ArchiveSpecOverride: "0 * * * * *", // 想临时改频率就写这里
 	})
 	defer stopCron()
 
-	// 2. 创建 Gin 引擎
+	// 2. 创建 Gin 引擎和中间件
 	r := gin.Default()
 	r.Use(func(c *gin.Context) {
-		// 将原始请求的详细信息打印到日志
 		dump, err := httputil.DumpRequest(c.Request, true)
 		if err != nil {
 			fmt.Println("Error dumping request:", err)
 		} else {
 			fmt.Printf("--- INCOMING REQUEST ---\n%s\n----------------------\n", string(dump))
 		}
-		c.Next() // 继续处理请求
+		c.Next()
 	})
+
 	config := cors.DefaultConfig()
 	config.AllowOrigins = []string{"http://localhost:5173"}
 	config.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization"}
 	config.MaxAge = 12 * time.Hour
-
 	r.Use(cors.New(config))
 
-	// 设置路由
+	// ===================================================================
+	// ===================== 核心修改在这里 ==============================
+	// ===================================================================
+
+	// 3. 【新增】实例化所有 Handler
+	// 将所有 handler 的创建逻辑集中在一起，方便管理
+	taskHandler := &handler.TaskHandler{DB: DB}
+	postHandler := handler.NewPostHandler(DB) // <-- 新增：实例化 PostHandler
+	// 【新增】实例化 UploadHandler，将初始化好的 minioClient 注入
+	uploadHandler := handler.NewUploadHandler(minioClient)
+	userHandler := handler.NewUserHandler(DB)       // <-- 新增
+	messageHandler := handler.NewMessageHandler(DB) // <-- 新增
+	// 4. 设置路由
 	apiV1 := r.Group("/api/v1")
+	apiV1.Use(middleware.AuthUserMiddleware())
 	{
 		// --- 公开路由 ---
 		apiV1.POST("/register", RegisterHandler)
 		apiV1.POST("/login", LoginHandler)
 
-		apiV1.GET("/posts", ListPostsHandler)
-		apiV1.GET("/posts/:id", GetPostHandler)
-		// --- 所有需要登录的路由都放在这个组里 ---
+		// 【修改】将论坛的公开路由指向新的 postHandler
+		apiV1.GET("/posts", postHandler.ListPosts)
+		apiV1.GET("/posts/:id", postHandler.GetPost)
+		// --- 需要认证的路由组 ---
 		auth := apiV1.Group("/")
-		auth.Use(middleware.AuthMiddleware()) // 应用普通用户认证
+		auth.Use(middleware.AuthMiddleware())
 		{
-			// Task Planner
-			taskHandler := &handler.TaskHandler{DB: DB}
+			// 【新增草稿箱路由】
+			auth.GET("/drafts", postHandler.ListDrafts)
 
+			// 【新增更新路由】
+			auth.PUT("/posts/:id", postHandler.UpdatePost)
+			auth.POST("/posts/:id/like", postHandler.ToggleLikePost) // 使用 POST 方法来切换状态
+			// --- Task Planner (你的现有逻辑，保持不变) ---
 			auth.POST("/tasks", taskHandler.Create)
-			auth.GET("/tasks", taskHandler.List) // ?view=auto|manual&status=todo|in_progress|done|archived
+			auth.GET("/tasks", taskHandler.List)
 			auth.GET("/tasks/:id", taskHandler.Get)
 			auth.PATCH("/tasks/:id", taskHandler.Update)
 			auth.DELETE("/tasks/:id", taskHandler.Delete)
@@ -2670,15 +2589,27 @@ func main() {
 			auth.POST("/tasks/:id/undo", taskHandler.Undo)
 			auth.GET("/tasks/score-trend", taskHandler.ScoreTrend)
 
-			// === 个人资源 ===
-			auth.POST("/users/:id/follow", FollowUserHandler)
-			auth.DELETE("/users/:id/follow", UnfollowUserHandler)
+			// --- 个人与社交资源 (你的现有逻辑，保持不变) ---
+			auth.POST("/users/:id/follow", userHandler.FollowUser)
+			auth.DELETE("/users/:id/follow", userHandler.UnfollowUser)
 			auth.GET("/users/:id", GetUserProfileHandler)
 			auth.GET("/profile", GetMyProfileHandler)
-			//文章
-			auth.POST("/posts", CreatePostHandler)
-			auth.POST("/posts/:id/replies", CreateReplyHandler)
-			// 个人内容节点 (Nodes)
+			// 私信
+			auth.POST("/messages", messageHandler.SendMessage)                 // 发送私信
+			auth.GET("/messages/with/:userID", messageHandler.GetConversation) // 获取与某人的对话
+			// --- 【新增】文件上传路由 ---
+			// 将其放在认证路由组内，意味着只有登录用户才能上传
+			uploads := auth.Group("/uploads")
+			{
+				uploads.POST("/file", uploadHandler.HandleFileUpload)
+			}
+			// 【修改】将论坛需要认证的路由指向新的 postHandler
+			auth.POST("/posts", postHandler.CreatePost)
+			auth.POST("/posts/:id/replies", postHandler.CreateReply)
+			auth.POST("/replies/:id/like", postHandler.ToggleLikeReply)
+			// 【新增路由】用于获取指定评论下的所有子回复
+			auth.GET("/replies/:id/children", postHandler.GetChildReplies)
+			// --- 个人内容节点 (Nodes) (你的现有逻辑，保持不变) ---
 			auth.GET("/nodes", ListNodesHandler)
 			auth.POST("/nodes", CreateNodeHandler)
 			auth.GET("/nodes/search", SearchNodesHandler)
@@ -2686,74 +2617,52 @@ func main() {
 			auth.PUT("/nodes/:id", UpdateNodeHandler)
 			auth.DELETE("/nodes/:id", DeleteNodeHandler)
 			auth.PUT("/nodes/:id/move", MoveNodeHandler)
-			auth.GET("/nodes/:id/recordings", ListRecordingsForNodeHandler) // 获取个人节点下的个人录音
+			auth.GET("/nodes/:id/recordings", ListRecordingsForNodeHandler)
 
-			// 个人录音 (Recordings)
+			// --- 个人录音 (Recordings) (你的现有逻辑，保持不变) ---
 			auth.GET("/recordings", ListMyRecordingsHandler)
 			auth.POST("/recordings/upload", UploadHandler)
 			auth.PUT("/recordings/:id", UpdateRecordingHandler)
 			auth.DELETE("/recordings/:id", DeleteRecordingHandler)
 			auth.POST("/recordings/:id/transcribe", TranscribeRecordingHandler)
-
-			// --- 社交互动 (作用于录音) ---
-			// 【补全】点赞功能路由
 			auth.POST("/recordings/:id/like", LikeRecordingHandler)
 			auth.DELETE("/recordings/:id/like", UnlikeRecordingHandler)
 			auth.POST("/recordings/:id/comments", CreateCommentHandler)
 			auth.GET("/recordings/:id/comments", ListCommentsHandler)
+			auth.POST("/recordings/:id/feature-in-domain", FeatureRecordingInDomainHandler)
 
-			// --- AI 助手 ---
+			// --- AI 助手 (你的现有逻辑，保持不变) ---
 			auth.POST("/ai/chat", AIChatHandler)
 
-			// === 圈子资源 (Domains) ===
-			// 圈子本身的创建、加入、列表
+			// --- 圈子资源 (Domains) (你的现有逻辑，保持不变) ---
 			auth.POST("/domains", CreateDomainHandler)
-			auth.POST("/domains/join", JoinDomainHandler) // 注意：这个 join 的逻辑可能需要调整
+			auth.POST("/domains/join", JoinDomainHandler)
 			auth.GET("/domains/my", ListMyDomainsHandler)
 			auth.GET("/domain-nodes/:id/recordings", ListRecordingsForDomainNodeHandler)
 			auth.POST("/domain-nodes/:id/comments", CreateDomainNodeCommentHandler)
 			auth.GET("/domain-nodes/:id/comments", ListDomainNodeCommentsHandler)
-			// --- 单个圈子内部的资源 ---
-			// 凡是涉及到具体某个圈子内部的操作，都放在 /domains/:domainId 下
+
 			domainSpecific := auth.Group("/domains/:domainId")
-
 			{
-				// 成员即可访问的
 				domainSpecific.GET("/details", GetDomainDetailsHandler)
-				domainSpecific.GET("/nodes", ListDomainNodesHandler) // 获取圈子内容树
-
-				// 【补全】获取圈子所有精选录音
+				domainSpecific.GET("/nodes", ListDomainNodesHandler)
 				domainSpecific.GET("/featured-recordings", ListDomainFeaturedRecordingsHandler)
-
-				// 【补全】获取单个圈子节点下的精选录音
-				// 注意：这里的 :nodeId 指的是 domain_node_id
 				domainSpecific.GET("/nodes/:nodeId/featured-recordings", ListFeaturedRecordingsForNode)
-
-				// 【补全】获取单个圈子节点下所有成员的录音 (供圈主审核)
-				// 这个需要圈主权限，我们在 Handler 内部检查
 				domainSpecific.GET("/nodes/:nodeId/all-recordings", ListAllRecordingsForNodeInDomainHandler)
+				domainSpecific.POST("/publish", PublishNodeToDomainHandler)
 
-				// --- 圈主才能管理的内容 ---
 				domainContent := domainSpecific.Group("/nodes")
-				domainContent.Use(DomainOwnerMiddleware()) // 对这个组应用圈主权限
+				domainContent.Use(DomainOwnerMiddleware())
 				{
 					domainContent.POST("", CreateDomainNodeHandler)
 					domainContent.PUT("/:nodeId", UpdateDomainNodeHandler)
 					domainContent.DELETE("/:nodeId", DeleteDomainNodeHandler)
 					domainContent.PUT("/:nodeId/move", MoveDomainNodeHandler)
 				}
-
-				// --- 圈主发布内容到圈子 ---
-				// 这个也需要圈主权限，可以在Handler内部检查，或者也用中间件
-				domainSpecific.POST("/publish", PublishNodeToDomainHandler)
 			}
-
-			// 【补全】圈主精选录音的操作
-			// 这个操作不依赖于 domainId，而是直接作用于 recordingId，但权限需要验证
-			// 所以放在 auth 根级别下
-			auth.POST("/recordings/:id/feature-in-domain", FeatureRecordingInDomainHandler)
 		}
 	}
 
+	// 5. 启动服务
 	r.Run(":8080")
 }

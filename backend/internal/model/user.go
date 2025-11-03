@@ -12,7 +12,7 @@ type User struct {
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"` // 在 JSON 响应中隐藏
-
+	AvatarURL string `json:"avatar_url"`
 	Username string `gorm:"unique;not null" json:"username"`
 	// Password 不应该被返回给前端
 	Password string `gorm:"not null" json:"-"`

@@ -4,5 +4,6 @@
         "vector": "cpp",
         "xstring": "cpp",
         "xutility": "cpp"
-    }
+    },
+    "CodeGPT.apiKey": "OpenAI"
 }
