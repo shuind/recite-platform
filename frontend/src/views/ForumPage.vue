@@ -1,123 +1,179 @@
 <template>
-  <div class="forum-page">
-    <div class="page-header">
-      <h1>社区论坛</h1>
-      <!-- 使用 router-link 跳转到专门的发帖页更符合 SPA 规范 -->
-      <router-link to="/forum/create-post">
-        <el-button type="primary">发布新帖</el-button>
-      </router-link>
+  <div class="forum-container" ref="forumContainerRef"> 
+    <div class="main-content">
+      <QuickPostBox @post-created="handleNewPost" />
+
+      <div class="post-list" v-loading="loading && posts.length === 0">
+        <div v-if="posts.length > 0">
+          <PostCard v-for="post in posts" :key="post.id" :post="post" @update:like="handlePostUpdate" />
+        </div>
+        <el-empty v-if="!loading && posts.length === 0" description="这里还没有帖子，快来发布第一篇吧！" />
+      </div>
+      
+      <div class="loading-more" v-if="isLoadingMore">
+        <el-skeleton :rows="3" animated />
+      </div>
+
+      <div class="no-more" v-if="!hasMore && posts.length > 0">
+        <el-divider>没有更多内容了</el-divider>
+      </div>
     </div>
-    
-    <el-table :data="posts" @row-click="goToPostDetail" v-loading="loading" style="cursor: pointer;">
-      <el-table-column label="主题" min-width="400">
-        <template #default="scope">
-            <div class="post-title">{{ scope.row.title }}</div>
-            <div class="post-meta">
-            <!-- 修正: scope.row.User -> scope.row.user -->
-            <!-- 修正: scope.row.user.id, scope.row.user.username -->
-            作者: <router-link :to="{ name: 'profile', params: { userId: scope.row.user.id } }" @click.stop>{{ scope.row.user.username }}</router-link>
-            </div>
-        </template>
-        </el-table-column>
-        <el-table-column label="回复/查看" width="150" align="center">
-        <template #default="scope">
-            <!-- 这两个字段已经是 snake_case，是正确的 -->
-            {{ scope.row.replies_count }} / {{ scope.row.views_count }}
-        </template>
-        </el-table-column>
-        <el-table-column label="最后回复" width="250">
-        <template #default="scope">
-            <!-- 修正: scope.row.LastRepliedByUser -> scope.row.last_replied_by_user -->
-            <div v-if="scope.row.last_replied_by_user">
-            <!-- last_replied_at 已经是 snake_case，是正确的 -->
-            <div>{{ new Date(scope.row.last_replied_at).toLocaleString() }}</div>
-            <div class="post-meta">
-                <!-- 修正: scope.row.last_replied_by_user.id, scope.row.last_replied_by_user.username -->
-                by <router-link :to="{ name: 'profile', params: { userId: scope.row.last_replied_by_user.id } }" @click.stop>{{ scope.row.last_replied_by_user.username }}</router-link>
-            </div>
-            </div>
-            <span v-else>暂无回复</span>
-        </template>
-        </el-table-column>
-    </el-table>
-    
-    <!-- 分页控件 -->
-    <div class="pagination-container">
-      <el-pagination
-        background
-        layout="prev, pager, next"
-        :total="pagination.total"
-        :page-size="pagination.limit"
-        :current-page="pagination.page"
-        @current-change="handlePageChange"
-      />
+
+    <div class="sidebar">
+      <CreatorCenterCard />
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue';
-import { useRouter } from 'vue-router';
+import { ref, reactive, onMounted, onUnmounted, watch } from 'vue';
+import { useRoute } from 'vue-router';
 import apiClient from '@/api';
-import { ElMessage } from 'element-plus'; // 引入 ElMessage
+import { ElMessage } from 'element-plus';
+import PostCard from '@/components/PostCard.vue';
+import QuickPostBox from '@/components/QuickPostBox.vue';
+import CreatorCenterCard from '@/components/CreatorCenterCard.vue';
 
 const posts = ref([]);
 const loading = ref(true);
-const router = useRouter();
+const isLoadingMore = ref(false);
+const hasMore = ref(true);
+
 const pagination = reactive({
   total: 0,
   page: 1,
-  limit: 20,
+  limit: 5,
 });
 
-const fetchPosts = async (page = 1) => {
+const scrollContainer = ref(null);
+const forumContainerRef = ref(null);
+const route = useRoute();
+
+const resetAndFetch = async () => {
+  posts.value = [];
+  pagination.page = 1;
+  hasMore.value = true;
+  isLoadingMore.value = false;
   loading.value = true;
+
+  if (scrollContainer.value && scrollContainer.value.scrollTo) {
+    scrollContainer.value.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  
+  await fetchPosts();
+};
+
+const fetchPosts = async () => {
+  if (isLoadingMore.value || !hasMore.value) return;
+
+  if (pagination.page > 1) {
+    isLoadingMore.value = true;
+  } else {
+    loading.value = true;
+  }
+
   try {
     const response = await apiClient.get('/posts', {
-      params: { page: page, limit: pagination.limit }
+      params: { 
+        page: pagination.page, 
+        limit: pagination.limit 
+      },
+      headers: {
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      },
     });
-    // 后端返回的 JSON 已经是 { posts: [...], total: ..., page: ... }
-    // 所以这里的访问是正确的
-    posts.value = response.data.posts;
+    
+    posts.value.push(...response.data.posts);
     pagination.total = response.data.total;
-    pagination.page = response.data.page;
+
+    if (response.data.posts.length < pagination.limit || posts.value.length >= pagination.total) {
+      hasMore.value = false;
+    } else {
+      pagination.page++;
+    }
   } catch (error) {
     console.error("Failed to fetch posts:", error);
     ElMessage.error("获取帖子列表失败");
+    hasMore.value = false;
   } finally {
     loading.value = false;
+    isLoadingMore.value = false;
   }
 };
 
+const handleScroll = () => {
+  if (!scrollContainer.value) return;
+  const { clientHeight, scrollTop, scrollHeight } = scrollContainer.value;
+  if (clientHeight + scrollTop >= scrollHeight - 200) {
+    fetchPosts();
+  }
+};
+
+// 【新增】处理子组件 PostCard 发出的 'update:like' 事件
+const handlePostUpdate = (payload) => {
+  const postToUpdate = posts.value.find(p => p.id === payload.postId);
+
+  if (postToUpdate) {
+    postToUpdate.is_liked_by_me = payload.is_liked_by_me;
+    postToUpdate.votes_count = payload.votes_count;
+  }
+};
+// 【新增】处理新帖子的回调函数
+const handleNewPost = (newPostData) => {
+  // 将子组件传递过来的新帖子数据，添加到帖子数组的顶部
+  posts.value.unshift(newPostData);
+  // 更新帖子总数，以保持分页逻辑的准确性
+  pagination.total++;
+};
 onMounted(() => {
-  fetchPosts(1);
+  resetAndFetch();
+  
+  if (forumContainerRef.value) {
+    scrollContainer.value = forumContainerRef.value.closest('.app-main-content');
+    if (scrollContainer.value) {
+      scrollContainer.value.addEventListener('scroll', handleScroll);
+    } else {
+      scrollContainer.value = window;
+      window.addEventListener('scroll', handleScroll);
+    }
+  }
 });
 
-const handlePageChange = (newPage) => {
-  fetchPosts(newPage);
-};
-
-const goToPostDetail = (row) => {
-  // 尝试将 row.id 转换为数字
-  const postId = Number(row.id);
-
-  // 检查转换后的结果是否是一个有效的数字 (不是 NaN)
-  // isNaN(null) 是 false，所以要额外检查 row.id 是否存在
-  if (row.id != null && !isNaN(postId)) { 
-    router.push({ name: 'post-detail', params: { postId: postId } });
-  } else {
-    console.error('Failed to get a valid post ID from row.id. Row data:', row);
-    ElMessage.error('无法跳转，帖子ID无效');
+onUnmounted(() => {
+  if (scrollContainer.value) {
+    scrollContainer.value.removeEventListener('scroll', handleScroll);
   }
-};
+});
+
+watch(
+  () => route.fullPath,
+  (newPath, oldPath) => {
+    if (posts.value.length > 0 && newPath === '/forum' && oldPath !== '/forum') {
+        console.log('Watcher: 检测到返回论坛主页，强制刷新帖子列表...');
+        resetAndFetch();
+    }
+  },
+  {
+    immediate: false
+  }
+);
 </script>
 
 <style scoped>
-.forum-page { padding: 20px; }
-.page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-.post-title { font-weight: 600; font-size: 16px; margin-bottom: 5px; }
-.post-meta { font-size: 12px; color: #909399; }
-.post-meta a { color: #909399; text-decoration: none; }
-.post-meta a:hover { text-decoration: underline; }
-.pagination-container { margin-top: 20px; display: flex; justify-content: center; }
+/* 样式部分保持不变 */
+.forum-container {
+  display: flex;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+  gap: 20px;
+  align-items: flex-start;
+}
+.main-content { flex: 1; min-width: 0; }
+.sidebar { width: 300px; position: sticky; top: 20px; }
+.post-list { background-color: #fff; border-radius: 4px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); overflow: hidden; }
+.loading-more { padding: 20px; background-color: #fff; margin-top: -1px; border-bottom-left-radius: 4px; border-bottom-right-radius: 4px; }
+.no-more { padding: 20px 0; color: #909399; font-size: 14px; text-align: center; }
 </style>

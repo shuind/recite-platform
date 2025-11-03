@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   backend:
@@ -17,6 +16,8 @@ services:
       - MINIO_SECRET_KEY=yoursecretkey
       - MINIO_USE_SSL=false
       - MINIO_BUCKET_NAME=recordings
+      # 【确保这一行存在且地址正确】
+      - MINIO_PUBLIC_ENDPOINT=http://localhost:9000
       - JWT_SECRET=a-very-secure-secret-for-jwt
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
       - OLLAMA_API_URL=http://host.docker.internal:11434/api/generate

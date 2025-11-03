@@ -22,7 +22,7 @@ export default defineConfig({
   server: {
     proxy: {
       // 当请求路径以 /api/v1 开头时，触发此代理规则
-      '/api/v1': {
+      '/api': {
         // 将请求转发到的目标服务器地址
         // !!! 请确保这里的端口号与你 Go 后端服务运行的端口号一致 !!!
         target: 'http://localhost:8080', 
